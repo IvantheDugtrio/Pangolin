@@ -1,12 +1,13 @@
 import argparse
-from pkg_resources import resource_filename
-from pangolin.model import *
-import vcf
+
 import gffutils
 import pandas as pd
 import pyfastx
-# import time
-# startTime = time.time()
+import pysam
+from pkg_resources import resource_filename
+
+from pangolin.model import *
+
 
 IN_MAP = np.asarray([[0, 0, 0, 0],
                      [1, 0, 0, 0],
@@ -240,20 +241,38 @@ def main():
             if line[0] != '#':
                 break
 
-        variants = vcf.Reader(filename=variants)
-        variants.infos["Pangolin"] = vcf.parser._Info(
-            "Pangolin",'.',"String","Pangolin splice scores. "
-            "Format: gene|pos:score_change|pos:score_change|warnings,...",'.','.')
-        fout = vcf.Writer(open(args.output_file+".vcf", 'w'), variants)
-
-        for i, variant in enumerate(variants):
-            scores = process_variant(lnum+i, str(variant.CHROM), int(variant.POS), variant.REF, str(variant.ALT[0]), gtf, models, args)
-            if scores != -1:
-                variant.INFO["Pangolin"] = scores
-            fout.write_record(variant)
-            fout.flush()
-
-        fout.close()
+        with pysam.VariantFile(variants) as variant_file, pysam.VariantFile(
+            args.output_file+".vcf", "w", header=variant_file.header
+        ) as out_variant_file:
+            out_variant_file.header.add_meta(
+                key="INFO",
+                items=[
+                    ("ID", "Pangolin"),
+                    ("Number", "."),
+                    ("Type", "String"),
+                    (
+                        "Description",
+                        "Pangolin splice scores. Format: gene|pos:score_change|pos:score_change|warnings,..."
+                    ),
+                ]
+            )
+            for i, variant_record in enumerate(variant_file):
+                variant_record.translate(out_variant_file.header)
+                assert variant_record.ref, f"Empty REF field in variant record {variant_record}"
+                assert variant_record.alts, f"Empty ALT field in variant record {variant_record}"
+                scores = process_variant(
+                    lnum + i,
+                    str(variant_record.contig),
+                    int(variant_record.pos),
+                    variant_record.ref,
+                    str(variant_record.alts[0]),
+                    gtf,
+                    models,
+                    args,
+                )
+                if scores != -1:
+                    variant_record.info["Pangolin"] = scores
+                out_variant_file.write(variant_record)
 
     elif variants.endswith(".csv"):
         col_ids = args.column_ids.split(',')
