@@ -1,6 +1,7 @@
 import argparse
 
 import gffutils
+import gzip
 import pandas as pd
 import pyfastx
 import pysam
@@ -27,19 +28,18 @@ def one_hot_encode(seq, strand):
     return IN_MAP[seq.astype('int8')]
 
 
-def compute_score(ref_seq, alt_seq, strand, d, models):
+def compute_score(ref_seq, alt_seq, strand, d, models, compute_platform):
     ref_seq = one_hot_encode(ref_seq, strand).T
     ref_seq = torch.from_numpy(np.expand_dims(ref_seq, axis=0)).float()
     alt_seq = one_hot_encode(alt_seq, strand).T
     alt_seq = torch.from_numpy(np.expand_dims(alt_seq, axis=0)).float()
 
-    if torch.cuda.is_available():
-        ref_seq = ref_seq.to(torch.device("cuda"))
-        alt_seq = alt_seq.to(torch.device("cuda"))
+    ref_seq = ref_seq.to(torch.device(compute_platform))
+    alt_seq = alt_seq.to(torch.device(compute_platform))
 
-    pangolin = []
+    pangolin = list()
     for j in range(4):
-        score = []
+        score = list()
         for model in models[3*j:3*j+3]:
             with torch.no_grad():
                 ref = model(ref_seq)[0][[1,4,7,10][j],:].cpu().numpy()
@@ -55,7 +55,7 @@ def compute_score(ref_seq, alt_seq, strand, d, models):
                     alt = np.concatenate([alt[0:l//2],np.max(alt[l//2:l//2+ndiff+1], keepdims=True),alt[l//2+ndiff+1:]])
                 score.append(alt-ref)
         pangolin.append(np.mean(score, axis=0))
-    
+
     pangolin = np.array(pangolin)
     loss = pangolin[np.argmin(pangolin, axis=0), np.arange(pangolin.shape[1])]
     gain = pangolin[np.argmax(pangolin, axis=0), np.arange(pangolin.shape[1])]
@@ -81,7 +81,7 @@ def get_genes(chr, pos, gtf):
     return (genes_pos, genes_neg)
 
 
-def process_variant(lnum, chr, pos, ref, alt, gtf, models, args):
+def process_variant(lnum, chr, pos, ref, alt, gtf, models, compute_platform, args):
     d = args.distance
     cutoff = args.score_cutoff
 
@@ -106,7 +106,7 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, args):
         print(e)
         print("[Line %s]" % lnum, "WARNING, skipping variant: Could not get sequence, possibly because the variant is too close to chromosome ends. "
                                   "See error message above.")
-        return -1    
+        return -1
 
     if seq[5000+d:5000+d+len(ref)] != ref:
         print("[Line %s]" % lnum, "WARNING, skipping variant: Mismatch between FASTA (ref base: %s) and variant file (ref base: %s)."
@@ -125,23 +125,23 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, args):
     # get splice scores
     loss_pos, gain_pos = None, None
     if len(genes_pos) > 0:
-        loss_pos, gain_pos = compute_score(ref_seq, alt_seq, '+', d, models)
+        loss_pos, gain_pos = compute_score(ref_seq, alt_seq, '+', d, models, compute_platform)
     loss_neg, gain_neg = None, None
     if len(genes_neg) > 0:
-        loss_neg, gain_neg = compute_score(ref_seq, alt_seq, '-', d, models)
+        loss_neg, gain_neg = compute_score(ref_seq, alt_seq, '-', d, models, compute_platform)
 
-    scores_list = []
+    scores_list = list()
     for (genes, loss, gain) in (
         (genes_pos,loss_pos,gain_pos),(genes_neg,loss_neg,gain_neg)
     ):
         # Emit a bundle of scores/warnings per gene; join them all later
         for gene, positions in genes.items():
-            per_gene_scores = []
+            per_gene_scores = list()
             warnings = "Warnings:"
             positions = np.array(positions)
             positions = positions - (pos - d)
 
-            if args.mask == "True" and len(positions) != 0:
+            if not args.no_mask and len(positions) != 0:
                 positions_filt = positions[(positions>=0) & (positions<len(loss))]
                 # set splice gain at annotated sites to 0
                 gain[positions_filt] = np.minimum(gain[positions_filt], 0)
@@ -149,14 +149,14 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, args):
                 not_positions = ~np.isin(np.arange(len(loss)), positions_filt)
                 loss[not_positions] = np.maximum(loss[not_positions], 0)
 
-            elif args.mask == "True":
+            elif not args.no_mask:
                 warnings += "NoAnnotatedSitesToMaskForThisGene"
                 loss[:] = np.maximum(loss[:], 0)
 
-            if args.score_exons == "True":
-                scores1 = [gene + '_sites1']
-                scores2 = [gene + '_sites2']
-            
+            if args.score_exons:
+                scores1 = [f"{gene}_sites1"]
+                scores2 = [f"{gene}_sites2"]
+
                 for i in range(len(positions)//2):
                     p1, p2 = positions[2*i], positions[2*i+1]
                     if p1<0 or p1>=len(loss):
@@ -175,7 +175,7 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, args):
                     scores2.append(f"{p2-d}:{s2}")
                 per_gene_scores += scores1 + scores2
 
-            elif cutoff != None:
+            elif cutoff:  # process if a cutoff is set
                 per_gene_scores.append(gene)
                 l, g = np.where(loss<=-cutoff)[0], np.where(gain>=cutoff)[0]
                 for p, s in zip(np.concatenate([g-d,l-d]), np.concatenate([gain[g],loss[l]])):
@@ -193,111 +193,158 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, args):
 
     return ','.join(scores_list)
 
-def main():
+
+def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("variant_file", help="VCF or CSV file with a header (see COLUMN_IDS option).")
-    parser.add_argument("reference_file", help="FASTA file containing a reference genome sequence.")
+    parser.add_argument("reference_file", help="FASTA file containing a reference genome sequence. Can be gzipped.")
     parser.add_argument("annotation_file", help="gffutils database file. Can be generated using create_db.py.")
     parser.add_argument("output_file", help="Prefix for output file. Will be a VCF/CSV if variant_file is VCF/CSV.")
     parser.add_argument("-c", "--column_ids", default="CHROM,POS,REF,ALT", help="(If variant_file is a CSV) Column IDs for: chromosome, variant position, reference bases, and alternative bases. "
                                                                                 "Separate IDs by commas. (Default: CHROM,POS,REF,ALT)")
-    parser.add_argument("-m", "--mask", default="True", choices=["False","True"], help="If True, splice gains (increases in score) at annotated splice sites and splice losses (decreases in score) at unannotated splice sites will be set to 0. (Default: True)")
+    parser.add_argument("--no_mask", action=argparse.BooleanOptionalAction, help="If present, splice gains (increases in score) at annotated splice sites and splice losses (decreases in score) at unannotated splice sites will not be set to 0. (Default: masked)")
     parser.add_argument("-s", "--score_cutoff", type=float, help="Output all sites with absolute predicted change in score >= cutoff, instead of only the maximum loss/gain sites.")
     parser.add_argument("-d", "--distance", type=int, default=50, help="Number of bases on either side of the variant for which splice scores should be calculated. (Default: 50)")
-    parser.add_argument("--score_exons", default="False", choices=["False","True"], help="Output changes in score for both splice sites of annotated exons, as long as one splice site is within the considered range (specified by -d). Output will be: gene|site1_pos:score|site2_pos:score|...")
-    args = parser.parse_args()
+    parser.add_argument("--score_exons", action=argparse.BooleanOptionalAction, help="Output changes in score for both splice sites of annotated exons, as long as one splice site is within the considered range (specified by -d). Output will be: gene|site1_pos:score|site2_pos:score|...")
+    return parser.parse_args()
 
-    variants = args.variant_file
-    gtf = args.annotation_file
+
+def validate_gtf(gtf):
     try:
         gtf = gffutils.FeatureDB(gtf)
     except:
         print("ERROR, annotation_file could not be opened. Is it a gffutils database file?")
-        exit()
+        exit(1)
+    return gtf
 
-    if torch.cuda.is_available():
-        print("Using GPU")
-    else:
-        print("Using CPU")
 
-    models = []
+def load_models():
+    models = list()
     for i in [0,2,4,6]:
         for j in range(1,4):
             model = Pangolin(L, W, AR)
             if torch.cuda.is_available():
+                compute_platform = 'cuda'
                 model.cuda()
-                weights = torch.load(resource_filename(__name__,"models/final.%s.%s.3.v2" % (j, i)))
+            elif torch.xpu.is_available():
+                compute_platform = 'xpu'
+                model.xpu()
+            elif torch.rocm.is_available():
+                compute_platform = 'rocm'
+                model.rocm()
             else:
-                weights = torch.load(resource_filename(__name__,"models/final.%s.%s.3.v2" % (j, i)), map_location=torch.device('cpu'))
+                compute_platform = 'cpu'
+            print(f"Using {compute_platform} for model models/final.{j}.{i}.3.v2")
+            weights = torch.load(resource_filename(__name__,f"models/final.{j}.{i}.3.v2"), map_location=torch.device(compute_platform))
             model.load_state_dict(weights)
             model.eval()
             models.append(model)
+    return models, compute_platform
 
-    if variants.endswith(".vcf"):
-        lnum = 0
-        # count the number of header lines
-        for line in open(variants, 'r'):
-            lnum += 1
-            if line[0] != '#':
-                break
 
-        with pysam.VariantFile(variants) as variant_file, pysam.VariantFile(
-            args.output_file+".vcf", "w", header=variant_file.header
-        ) as out_variant_file:
-            out_variant_file.header.add_meta(
-                key="INFO",
-                items=[
-                    ("ID", "Pangolin"),
-                    ("Number", "."),
-                    ("Type", "String"),
-                    (
-                        "Description",
-                        "Pangolin splice scores. Format: gene|pos:score_change|pos:score_change|warnings,..."
-                    ),
-                ]
-            )
-            for i, variant_record in enumerate(variant_file):
-                variant_record.translate(out_variant_file.header)
-                assert variant_record.ref, f"Empty REF field in variant record {variant_record}"
-                assert variant_record.alts, f"Empty ALT field in variant record {variant_record}"
-                scores = process_variant(
-                    lnum + i,
-                    str(variant_record.contig),
-                    int(variant_record.pos),
-                    variant_record.ref,
-                    str(variant_record.alts[0]),
-                    gtf,
-                    models,
-                    args,
-                )
-                if scores != -1:
-                    variant_record.info["Pangolin"] = scores
-                out_variant_file.write(variant_record)
+def annotate_variants(out_variant_file, variant_file, lnum, gtf, models, compute_platform, args):
+    out_variant_file.header.add_meta(
+        key="INFO",
+        items=[
+            ("ID", "Pangolin"),
+            ("Number", "."),
+            ("Type", "String"),
+            (
+                "Description",
+                "Pangolin splice scores. Format: gene|pos:score_change|pos:score_change|warnings,..."
+            ),
+        ]
+    )
+    for i, variant_record in enumerate(variant_file):
+        variant_record.translate(out_variant_file.header)
+        assert variant_record.ref, f"Empty REF field in variant record {variant_record}"
+        assert variant_record.alts, f"Empty ALT field in variant record {variant_record}"
+        scores = process_variant(
+            lnum + i,
+            str(variant_record.contig),
+            int(variant_record.pos),
+            variant_record.ref,
+            str(variant_record.alts[0]),
+            gtf,
+            models,
+            compute_platform,
+            args
+        )
+        if scores != -1:
+            variant_record.info["Pangolin"] = scores
+        out_variant_file.write(variant_record)
 
-    elif variants.endswith(".csv"):
-        col_ids = args.column_ids.split(',')
-        variants = pd.read_csv(variants, header=0)
-        fout = open(args.output_file+".csv", 'w')
-        fout.write(','.join(variants.columns)+',Pangolin\n')
+
+def count_hdr_lines(vcf_hdr):
+    lnum = 0
+    for line in vcf_hdr:
+        lnum += 1
+        if not line.startswith('#'):
+            return lnum
+
+
+def process_vcf(vcf_file, gtf, models, compute_platform, args):
+    # count the number of header lines
+    ext=''
+    if vcf_file.endswith('.gz'):
+        ext='.gz'
+        with gzip.open(vcf_file, 'rt') as vcf_hdr:
+            lnum = count_hdr_lines(vcf_hdr)
+    else:
+        with open(vcf_file, 'r') as vcf_hdr:
+            lnum = count_hdr_lines(vcf_hdr)
+
+
+    with pysam.VariantFile(vcf_file) as variant_file, pysam.VariantFile(
+        f"{args.output_file}.vcf{ext}", 'w', header=variant_file.header
+    ) as out_variant_file:
+        annotate_variants(out_variant_file, variant_file, lnum, gtf, models, compute_platform, args)
+
+
+def process_csv(csv_file, gtf, models, compute_platform, args):
+    col_ids = args.column_ids.split(',')
+    variants = pd.read_csv(csv_file, header=0)
+    fout = open(f"{args.output_file}.csv", 'w')
+    fout.write(','.join(variants.columns)+',Pangolin\n')
+    fout.flush()
+
+    for lnum, variant in variants.iterrows():
+        chr, pos, ref, alt = variant[col_ids]
+        ref, alt = ref.upper(), alt.upper()
+        scores = process_variant(
+            lnum + 1,
+            str(chr),
+            int(pos),
+            ref,
+            alt,
+            gtf,
+            models,
+            compute_platform,
+            args
+        )
+        if scores == -1:
+            fout.write(','.join(variant.to_csv(header=False, index=False).split('\n'))+'\n')
+        else:
+            fout.write(','.join(variant.to_csv(header=False, index=False).split('\n'))+scores+'\n')
         fout.flush()
 
-        for lnum, variant in variants.iterrows():
-            chr, pos, ref, alt = variant[col_ids]
-            ref, alt = ref.upper(), alt.upper()
-            scores = process_variant(lnum+1, str(chr), int(pos), ref, alt, gtf, models, args)
-            if scores == -1:
-                fout.write(','.join(variant.to_csv(header=False, index=False).split('\n'))+'\n')
-            else:
-                fout.write(','.join(variant.to_csv(header=False, index=False).split('\n'))+scores+'\n')
-            fout.flush()
+    fout.close()
 
-        fout.close()
 
+def main():
+    args = get_args()
+    variants = args.variant_file
+    gtf = validate_gtf(args.annotation_file)
+    models, compute_platform = load_models()
+    if 'vcf' in variants:
+        process_vcf(variants, gtf, models, compute_platform, args)
+    elif variants.endswith('.csv'):
+        process_csv(variants, gtf, models, compute_platform, args)
     else:
         print("ERROR, variant_file needs to be a CSV or VCF.")
+    #executionTime = (time.time() - startTime)
+    #print('Execution time in seconds: ' + str(executionTime))
 
-    # executionTime = (time.time() - startTime)
-    # print('Execution time in seconds: ' + str(executionTime))
 
 if __name__ == '__main__':
     main()
