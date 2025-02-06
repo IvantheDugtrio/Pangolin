@@ -226,9 +226,9 @@ def load_models():
             if torch.cuda.is_available():
                 compute_platform = 'cuda'
                 model.cuda()
-            elif torch.mpi.is_available():
-                compute_platform = 'mpi'
-                model.mpi()
+            elif torch.mps.is_available():
+                compute_platform = 'mps'
+                model.to('mps')
             elif torch.xpu.is_available():
                 compute_platform = 'xpu'
                 model.xpu()
