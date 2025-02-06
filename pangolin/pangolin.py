@@ -225,20 +225,18 @@ def load_models():
             model = Pangolin(L, W, AR)
             if torch.cuda.is_available():
                 compute_platform = 'cuda'
-                model.cuda()
             elif torch.mps.is_available():
                 compute_platform = 'mps'
-                model.to('mps')
             elif torch.xpu.is_available():
                 compute_platform = 'xpu'
-                model.xpu()
             elif torch.rocm.is_available():
                 compute_platform = 'rocm'
-                model.rocm()
             else:
                 compute_platform = 'cpu'
             print(f"Using {compute_platform} for model models/final.{j}.{i}.3.v2")
-            weights = torch.load(resource_filename(__name__,f"models/final.{j}.{i}.3.v2"), map_location=torch.device(compute_platform))
+            torch_device = torch.device(compute_platform)
+            weights = torch.load(resource_filename(__name__,f"models/final.{j}.{i}.3.v2"), map_location=torch_device)
+            model.to(torch_device)
             model.load_state_dict(weights)
             model.eval()
             models.append(model)
