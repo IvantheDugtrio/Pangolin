@@ -82,15 +82,16 @@ def get_genes(chr, pos, gtf):
 
 
 def process_variant(lnum, chr, pos, ref, alt, gtf, models, compute_platform, args):
+    warning_msg_base = f"[{chr} {pos} {ref} {alt}] Warning, skipping variant: "
     d = args.distance
     cutoff = args.score_cutoff
 
     if len(set("ACGT").intersection(set(ref))) == 0 or len(set("ACGT").intersection(set(alt))) == 0 \
             or (len(ref) != 1 and len(alt) != 1 and len(ref) != len(alt)):
-        print("[Line %s]" % lnum, "WARNING, skipping variant: Variant format not supported.")
+        print(warning_msg_base + "Variant format not supported.")
         return -1
     elif len(ref) > 2*d:
-        print("[Line %s]" % lnum, "WARNING, skipping variant: Deletion too large")
+        print(warning_msg_base + "skipping variant: Deletion too large")
         return -1
 
     fasta = pyfastx.Fasta(args.reference_file)
@@ -104,12 +105,11 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, compute_platform, arg
         seq = fasta[chr][pos-5001-d:pos+len(ref)+4999+d].seq
     except Exception as e:
         print(e)
-        print("[Line %s]" % lnum, "WARNING, skipping variant: Could not get sequence, possibly because the variant is too close to chromosome ends. "
-                                  "See error message above.")
+        print(warning_msg_base + "Could not get sequence, possibly because the variant is too close to chromosome ends.\nSee error message above.")
         return -1
 
     if seq[5000+d:5000+d+len(ref)] != ref:
-        print("[Line %s]" % lnum, "WARNING, skipping variant: Mismatch between FASTA (ref base: %s) and variant file (ref base: %s)."
+        print(warning_msg_base + "Mismatch between FASTA (ref base: %s) and variant file (ref base: %s)."
               % (seq[5000+d:5000+d+len(ref)], ref))
         return -1
 
@@ -119,7 +119,7 @@ def process_variant(lnum, chr, pos, ref, alt, gtf, models, compute_platform, arg
     # get genes that intersect variant
     genes_pos, genes_neg = get_genes(chr, pos, gtf)
     if len(genes_pos)+len(genes_neg)==0:
-        print("[Line %s]" % lnum, "WARNING, skipping variant: Variant not contained in a gene body. Do GTF/FASTA chromosome names match?")
+        print(warning_msg_base + "Variant not contained in a gene body. Do GTF/FASTA chromosome names match?")
         return -1
 
     # get splice scores
@@ -226,6 +226,9 @@ def load_models():
             if torch.cuda.is_available():
                 compute_platform = 'cuda'
                 model.cuda()
+            elif torch.mpi.is_available():
+                compute_platform = 'mpi'
+                model.mpi()
             elif torch.xpu.is_available():
                 compute_platform = 'xpu'
                 model.xpu()
